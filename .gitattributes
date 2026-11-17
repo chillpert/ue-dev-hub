@@ -1,0 +1,11 @@
+* text=auto
+
+# Shell scripts run through bash, which chokes on CRLF, also on Windows through Git Bash.
+*.sh text eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.gif binary
+*.zip binary

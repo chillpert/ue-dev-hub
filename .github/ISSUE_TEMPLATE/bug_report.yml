@@ -1,0 +1,61 @@
+name: Bug report
+description: Something doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: os-details
+    attributes:
+      label: Linux distribution and desktop
+      description: Only for Linux, like "Ubuntu 24.04, GNOME, Wayland".
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you run the hub
+      options:
+        - Windows installer
+        - Portable ue-dev-hub.exe (through Launch.sh)
+        - AppImage
+        - .deb package
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Hub version
+      description: Shown in Settings.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Unreal Engine version
+      placeholder: "5.8, or a source build"
+  - type: textarea
+    id: log
+    attributes:
+      label: hub.log
+      description: |
+        Attach `hub.log`, or paste the part around the problem. It's in
+        `%LOCALAPPDATA%\com.chillpert.uedevhub\logs` on Windows and
+        `~/.local/share/com.chillpert.uedevhub/logs` on Linux; `hub.old.log` there is the run before.
+        Remove anything private first, like server addresses or names.
+      render: text

@@ -1,0 +1,74 @@
+# Builds and tests the hub on Windows and Linux for pull requests and for pushes to main.
+# Run it on any other branch from the Actions tab ("Run workflow").
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces a run that hasn't finished.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config git-lfs zip unzip
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Installs the version and components in rust-toolchain.toml.
+      - name: Rust
+        run: rustup toolchain install
+
+      # Only main saves the cache, so a pull request can't plant something that later runs use.
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            addon-sdk
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - run: npm ci
+
+      - name: Check the UI
+        run: npx tsc --noEmit
+
+      - name: Build the UI
+        run: npm run build
+
+      - name: Run the tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Lint
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test and lint the addon SDK
+        working-directory: addon-sdk
+        run: |
+          cargo test
+          cargo clippy --all-targets -- -D warnings

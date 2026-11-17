@@ -1,0 +1,12 @@
+[package]
+name = "ue-dev-hub-addon"
+version = "1.0.0"
+description = "What UE Dev Hub addon helpers use to talk to the hub"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/chillpert/ue-dev-hub"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,5 @@
+# The Rust version CI, releases and local builds use. Bump it on purpose, in its own commit.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

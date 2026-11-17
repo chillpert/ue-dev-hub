@@ -1,0 +1,317 @@
+# Builds and publishes a release when a version tag like v0.2.0 is pushed.
+#
+# Run it by hand from the Actions tab ("Run workflow") for a dry run: it builds and signs everything
+# with a throwaway key and keeps the files as a workflow artifact named "release", but publishes
+# nothing and never sees the real signing key.
+#
+# Publishes:
+#   latest.json                      what installed hubs check to update themselves:
+#                                    windows-x86_64(-nsis) gets the installer, linux-x86_64-appimage
+#                                    the AppImage. There's no plain linux-x86_64 entry, so a .deb
+#                                    install is never handed the AppImage.
+#   SHA256SUMS                       checksums of every file, for checking a first download by hand
+#   Windows: the installer, plus under fixed names
+#     ue-dev-hub.exe (+ .sig)       the hub without installing, for Launch.sh and its self-update
+#     ue-dev-hub-setup.exe (+ .sig) the installer, for "Install UE Dev Hub"
+#   Linux: the .deb and the AppImage, plus the AppImage under a fixed name
+#     ue-dev-hub.AppImage (+ .sig)  for Launch.sh; it updates itself like an installed hub
+#
+# Each platform builds into a workflow artifact. One job then checks every signature, writes
+# latest.json and SHA256SUMS once, and a last job creates the draft release, uploads everything and
+# publishes it. Nothing is ever public with a platform missing.
+#
+# Needs TAURI_SIGNING_PRIVATE_KEY (the content of the updater's private key file) and, if the key has
+# one, TAURI_SIGNING_PRIVATE_KEY_PASSWORD, as secrets of the "release" environment. Only the build
+# step of a tag push gets them. Actions are pinned to commits so a moved tag can't reach the key, and
+# release jobs use no caches.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check the versions match each other and the tag
+        id: version
+        shell: pwsh
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $npm = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $lock = ((Get-Content src-tauri/Cargo.lock -Raw) | Select-String -Pattern '(?m)^name = "ue-dev-hub"\r?\nversion = "(.+)"').Matches[0].Groups[1].Value
+          $all = "tauri.conf.json $conf, package.json $npm, Cargo.toml $cargo, Cargo.lock $lock"
+          foreach ($v in @($npm, $cargo, $lock)) {
+            if ($v -ne $conf) { throw "The versions don't match: $all. Bump all of them (run cargo check for Cargo.lock)." }
+          }
+          if ($env:EVENT -eq "push") {
+            $tag = $env:REF_NAME.TrimStart("v")
+            if ($tag -ne $conf) { throw "The tag v$tag doesn't match the versions: $all." }
+          }
+          "version=$conf" >> $env:GITHUB_OUTPUT
+          "tag=v$conf" >> $env:GITHUB_OUTPUT
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            bundles: nsis
+          - os: ubuntu-22.04
+            platform: linux
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    # The signing key lives in the "release" environment, which only v* tags can use. A dry run uses
+    # no environment and signs with a throwaway key.
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config git-lfs zip unzip
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # Installs the version and components in rust-toolchain.toml.
+      - name: Rust
+        run: rustup toolchain install
+
+      - run: npm ci
+
+      - name: Run the tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Throwaway signing key for a dry run
+        if: github.event_name != 'push'
+        shell: bash
+        run: npx tauri signer generate --ci -w "$RUNNER_TEMP/dry-run.key"
+
+      - name: Build, sign and collect the files
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name == 'push' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name == 'push' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          BUNDLES: ${{ matrix.bundles }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+              echo "::error::The release environment has no TAURI_SIGNING_PRIVATE_KEY secret."
+              exit 1
+            fi
+          else
+            TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/dry-run.key")"
+            export TAURI_SIGNING_PRIVATE_KEY
+          fi
+
+          npm run tauri -- build --bundles "$BUNDLES"
+
+          bundle=src-tauri/target/release/bundle
+          mkdir -p release
+          # The one file in folder $1 whose name ends with $2, or fail. Tauri's names have spaces.
+          one() {
+            shopt -s nullglob
+            local found=( "$1"/*"$2" )
+            if [ "${#found[@]}" -ne 1 ]; then
+              echo "::error::Expected one $1/*$2, found ${#found[@]}." >&2
+              exit 1
+            fi
+            echo "${found[0]}"
+          }
+          # Copies a bundle and its updater signature. Release file names have no spaces, since
+          # GitHub would rename them.
+          with_sig() {
+            cp "$1" "release/$2"
+            cp "$1.sig" "release/$2.sig"
+          }
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            setup=$(one "$bundle/nsis" -setup.exe)
+            with_sig "$setup" "UE-Dev-Hub_${VERSION}_x64-setup.exe"
+            with_sig "$setup" ue-dev-hub-setup.exe
+            # The plain exe has no updater signature of its own; selfupdate.rs checks that this one
+            # was signed for ue-dev-hub.exe.
+            cp src-tauri/target/release/ue-dev-hub.exe release/ue-dev-hub.exe
+            npx tauri signer sign --app-version "$VERSION" release/ue-dev-hub.exe
+          else
+            appimage=$(one "$bundle/appimage" .AppImage)
+            with_sig "$appimage" "UE-Dev-Hub_${VERSION}_amd64.AppImage"
+            with_sig "$appimage" ue-dev-hub.AppImage
+            deb=$(one "$bundle/deb" .deb)
+            cp "$deb" "release/UE-Dev-Hub_${VERSION}_amd64.deb"
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" != push ]; then
+            # Lets the next job check the throwaway signatures. Never part of a release.
+            cp "$RUNNER_TEMP/dry-run.key.pub" release/dry-run.pub
+          fi
+          ls -l release
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.platform }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Checks every signature and writes latest.json and SHA256SUMS once, from both platforms' files.
+  assemble:
+    needs: [check, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          path: builds
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          path: source
+          sparse-checkout: src-tauri/tauri.conf.json
+          sparse-checkout-cone-mode: false
+
+      - name: Check the signatures, write latest.json and SHA256SUMS
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TAG: ${{ needs.check.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+          real_key=$(jq -r '.plugins.updater.pubkey' source/src-tauri/tauri.conf.json)
+          mkdir release
+          for dir in builds/build-windows builds/build-linux; do
+            [ -d "$dir" ] || { echo "::error::$dir is missing."; exit 1; }
+            key="$real_key"
+            if [ "$GITHUB_EVENT_NAME" != push ]; then
+              key=$(cat "$dir/dry-run.pub")
+              rm "$dir/dry-run.pub"
+            fi
+            printf '%s' "$key" | base64 -d > "$RUNNER_TEMP/key.pub"
+            for sig in "$dir"/*.sig; do
+              base64 -d "$sig" > "$RUNNER_TEMP/minisig"
+              if ! minisign -Vq -p "$RUNNER_TEMP/key.pub" -m "${sig%.sig}" -x "$RUNNER_TEMP/minisig"; then
+                echo "::error::${sig#builds/} doesn't match the updater's public key."
+                exit 1
+              fi
+            done
+            cp "$dir"/* release/
+          done
+
+          setup="UE-Dev-Hub_${VERSION}_x64-setup.exe"
+          appimage="UE-Dev-Hub_${VERSION}_amd64.AppImage"
+          for f in "$setup" "$setup.sig" ue-dev-hub-setup.exe ue-dev-hub-setup.exe.sig ue-dev-hub.exe ue-dev-hub.exe.sig \
+                   "$appimage" "$appimage.sig" ue-dev-hub.AppImage ue-dev-hub.AppImage.sig "UE-Dev-Hub_${VERSION}_amd64.deb"; do
+            [ -s "release/$f" ] || { echo "::error::$f is missing from the build."; exit 1; }
+          done
+
+          base="https://github.com/$REPO/releases/download/$TAG"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg windows_url "$base/$setup" --rawfile windows_sig "release/$setup.sig" \
+            --arg linux_url "$base/$appimage" --rawfile linux_sig "release/$appimage.sig" \
+            '($windows_sig | gsub("\\s+$"; "")) as $ws | ($linux_sig | gsub("\\s+$"; "")) as $ls |
+             {
+               version: $version,
+               notes: "See the release page for what changed.",
+               pub_date: $date,
+               platforms: {
+                 "windows-x86_64-nsis": { signature: $ws, url: $windows_url },
+                 "windows-x86_64": { signature: $ws, url: $windows_url },
+                 "linux-x86_64-appimage": { signature: $ls, url: $linux_url }
+               }
+             }' > release/latest.json
+
+          # Every platform must be there, each with a signature and a file in this release.
+          for platform in windows-x86_64-nsis windows-x86_64 linux-x86_64-appimage; do
+            url=$(jq -er --arg p "$platform" '.platforms[$p].url' release/latest.json)
+            jq -er --arg p "$platform" '.platforms[$p].signature | select(length > 0)' release/latest.json > /dev/null
+            [ -f "release/${url##*/}" ] || { echo "::error::latest.json points $platform at ${url##*/}, which isn't in the release."; exit 1; }
+          done
+          cat release/latest.json
+
+          (cd release && sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS")
+          mv "$RUNNER_TEMP/SHA256SUMS" release/SHA256SUMS
+          cat release/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Only for tag pushes. The draft is created here, after both platforms built, so there's exactly
+  # one release and it goes public only once every file is uploaded.
+  publish:
+    needs: [check, assemble]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Create the draft release and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # A re-run finds the draft from the failed attempt and replaces its files.
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then
+              echo "::error::$TAG is already published. Release a new version instead."
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --draft --verify-tag --title "UE Dev Hub $TAG" --generate-notes
+          fi
+          gh release upload "$TAG" release/* --clobber
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest
