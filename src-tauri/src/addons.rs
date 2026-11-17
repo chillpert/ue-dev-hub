@@ -534,12 +534,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = temp("exec-root");
         let src = temp("exec-src").join("demo-addon");
-        write_addon(&src, &format!("{DEMO}[helper]\nlinux = \"bin/helper\"\n"));
+        // Its own id: installing takes a lock per addon id, which another test holds for "demo".
+        let manifest = DEMO.replace("id = \"demo\"", "id = \"demo-exec\"");
+        write_addon(&src, &format!("{manifest}[helper]\nlinux = \"bin/helper\"\n"));
         std::fs::create_dir_all(src.join("bin")).unwrap();
         std::fs::write(src.join("bin/helper"), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(src.join("bin/helper"), std::fs::Permissions::from_mode(0o644)).unwrap();
         install_into(&root, &src, "1.0.0", Expect::default()).unwrap();
-        let mode = std::fs::metadata(root.join("demo/bin/helper")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(root.join("demo-exec/bin/helper")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(src.parent().unwrap());
