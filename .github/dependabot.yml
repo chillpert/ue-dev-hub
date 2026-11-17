@@ -1,0 +1,32 @@
+# Monthly, one pull request per group, so updates stay few. Security fixes come separately, as
+# soon as they exist (Settings > Advanced Security).
+version: 2
+updates:
+  # The workflows pin actions to commits, so nothing else moves them forward.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - /src-tauri
+      - /addon-sdk
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # Tauri's npm packages must stay on the same minor version as its Rust crates: merge this one
+  # together with the cargo one when either moves Tauri.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]
